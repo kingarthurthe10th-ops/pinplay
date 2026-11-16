@@ -295,3 +295,32 @@ float ui_textBox(float x, float y, float w, float h, float maxSize, float minSiz
 	for (int i = 0; i < wr->n; i++) ui_text(tx, ty + i * lh, size, c, align, wr->lines[i]);
 	return size;
 }
+
+// ---- network picture (pin questions)
+static C3D_Tex pic; static bool picOk; static int picTW, picTH, picW, picH; static C2D_Image picImg; static Tex3DS_SubTexture picSub;
+void ui_imageClear(void) { if (picOk) { C3D_TexDelete(&pic); picOk = false; } }
+bool ui_imageSet(const u32 *px, int w, int h) {
+	ui_imageClear();
+	if (w <= 0 || h <= 0 || w > 512 || h > 512) return false;
+	int tw = 8, th = 8; while (tw < w) tw <<= 1; while (th < h) th <<= 1;
+	if (!C3D_TexInit(&pic, tw, th, GPU_RGBA8)) return false;
+	picOk = true; picTW = tw; picTH = th; picW = w; picH = h;
+	C3D_TexSetFilter(&pic, GPU_LINEAR, GPU_LINEAR);
+	u32 *dst = pic.data; memset(dst, 0, tw * th * 4);
+	for (int y = 0; y < h; y++)
+		for (int x = 0; x < w; x++) {
+			u32 m = (x & 1) | ((y & 1) << 1) | ((x & 2) << 1) | ((y & 2) << 2) | ((x & 4) << 2) | ((y & 4) << 3);
+			dst[((y >> 3) * (tw >> 3) + (x >> 3)) * 64 + m] = px[y * w + x];
+		}
+	GSPGPU_FlushDataCache(dst, tw * th * 4);
+	picSub = (Tex3DS_SubTexture){ (u16)w, (u16)h, 0.0f, 1.0f, (float)w / tw, 1.0f - (float)h / th };
+	picImg = (C2D_Image){ &pic, &picSub };
+	return true;
+}
+bool ui_imageDraw(float x, float y, float w, float h) {
+	if (!picOk) return false;
+	C2D_DrawImageAt(picImg, x, y, 0.5f, NULL, w / picW, h / picH);
+	return true;
+}
+int ui_imageW(void) { return picOk ? picW : 0; }
+int ui_imageH(void) { return picOk ? picH : 0; }

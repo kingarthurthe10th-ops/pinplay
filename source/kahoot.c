@@ -27,6 +27,7 @@ typedef struct Session {
 	WS *ws; char path[1800];
 	char clientId[64], cid[32];
 	int msgId; long long ack; int lag; long long offset;
+	int avType, avItem;
 	bool handshook, connected, loginSent, joined, everJoined, namerator, team, twoStep;
 	u64 lastRx;
 } Session;
@@ -84,6 +85,25 @@ void kahoot_answerText(int qi, const char *qt, const char *text) {
 	char esc[600]; json_esc(esc, sizeof esc, text);
 	char b[800]; snprintf(b, sizeof b, "{\"type\":\"%s\",\"text\":%s,\"questionIndex\":%d}", qt, esc, qi);
 	queueMsg(45, b);
+}
+void kahoot_answerNumber(int qi, const char *qt, double v, int dec) {
+	char b[160]; snprintf(b, sizeof b, "{\"type\":\"%s\",\"choice\":%.*f,\"questionIndex\":%d}", qt, dec < 0 ? 0 : dec, v, qi);
+	queueMsg(45, b);
+}
+void kahoot_answerPin(int qi, const char *qt, double x, double y) {
+	char b[200];
+	if (!strcmp(qt, "pin_it")) snprintf(b, sizeof b, "{\"type\":\"pin_it\",\"pin\":{\"x\":%.2f,\"y\":%.2f},\"choice\":[%.2f,%.2f],\"questionIndex\":%d}", x, y, x, y, qi);
+	else snprintf(b, sizeof b, "{\"type\":\"%s\",\"pin\":{\"x\":%.2f,\"y\":%.2f},\"questionIndex\":%d}", qt, x, y, qi);
+	queueMsg(45, b);
+}
+void kahoot_setAvatar(int type, int item) {
+	char b[96]; snprintf(b, sizeof b, "{\"avatar\":{\"type\":%d,\"item\":%d}}", type, item);
+	queueMsg(46, b);
+}
+void kahoot_sendFeedback(int fun, int learning, int recommend, int overall, int totalScore) {
+	char nm[160]; json_esc(nm, sizeof nm, lastNick);
+	char b[400]; snprintf(b, sizeof b, "{\"nickname\":%s,\"totalScore\":%d,\"fun\":%d,\"learning\":%d,\"recommend\":%d,\"overall\":%d}", nm, totalScore, fun, learning, recommend, overall);
+	queueMsg(11, b);
 }
 void kahoot_twoStep(const int seq[4]) {
 	Session *s = cur; if (!s) return;
@@ -243,6 +263,115 @@ static bool modeUnsupported(int id) {
 }
 
 // ---- incoming
+static void parseQuestion(KEvent *e, JNode *c, bool getReady) {
+	e->type = getReady ? KE_GET_READY : KE_QUESTION;
+	e->index = (int)jnum(c, "gameBlockIndex", jnum(c, "questionIndex", 0));
+	e->total = (int)jnum(c, "totalGameBlockCount", 0);
+	snprintf(e->qtype, sizeof e->qtype, "%s", jstr(c, "type", jstr(c, "gameBlockType", "quiz")));
+	snprintf(e->layout, sizeof e->layout, "%s", jstr(c, "layout", ""));
+	if (getReady) e->timeMs = jhas(c, "getReadyTimeAvailable") ? (int)jnum(c, "getReadyTimeAvailable", 5000)
+	                        : jhas(c, "timeLeft") ? (int)(jnum(c, "timeLeft", 5) * 1000) : 5000;
+	else e->timeMs = (int)jnum(c, "timeRemaining", jnum(c, "timeAvailable", 20000));     // ms left
+	plain(e->title, sizeof e->title, jstr(c, "title", ""));
+	JNode *ch = jget(c, "choices");
+	int nc = (int)jnum(c, "numberOfChoices", jlen(ch));
+	if (nc <= 0) nc = jlen(ch);
+	if (nc > K_MAXCHOICES) nc = K_MAXCHOICES;
+	e->numChoices = nc;
+	for (int i = 0; i < nc && ch; i++) {
+		JNode *o = jat(ch, i);
+		const char *a = o ? jstr(o, "answer", NULL) : NULL;
+		if (a && *a) { plain(e->choice[i], sizeof e->choice[i], a); e->hasChoiceText = true; }
+	}
+	e->allowed = (int)jnum(c, "numberOfAnswersAllowed", 1);
+	e->answered = jbool(c, "answered", false);
+	// slider
+	e->sMin = jnum(c, "minRange", 0); e->sMax = jnum(c, "maxRange", 10); e->sStep = jnum(c, "step", 1);
+	if (e->sStep <= 0) e->sStep = 1;
+	if (e->sMax <= e->sMin) e->sMax = e->sMin + 10 * e->sStep;
+	plain(e->unit, sizeof e->unit, jstr(c, "unit", ""));
+	// scale / nps
+	if (!strcmp(e->qtype, "nps")) { e->scStart = 0; e->scEnd = 10; snprintf(e->scLabelType, sizeof e->scLabelType, "probability"); }
+	else {
+		e->scStart = (int)jnum(c, "start", 1); e->scEnd = (int)jnum(c, "end", 5);
+		snprintf(e->scLabelType, sizeof e->scLabelType, "%s", jstr(c, "labelType", "agreement"));
+	}
+	if (e->scEnd < e->scStart || e->scEnd - e->scStart > 10) { e->scStart = 1; e->scEnd = 5; }
+	plain(e->scLow, sizeof e->scLow, jstr(c, "startLabelText", ""));
+	plain(e->scHigh, sizeof e->scHigh, jstr(c, "endLabelText", ""));
+	// picture (pin questions)
+	const char *img = jstr(c, "image", "");
+	JNode *meta = jget(c, "imageMetadata");
+	if ((!img || !*img) && meta && jstr(meta, "id", NULL)) snprintf(e->image, sizeof e->image, "https://images-cdn.kahoot.it/%s", jstr(meta, "id", ""));
+	else snprintf(e->image, sizeof e->image, "%s", img ? img : "");
+	if (!getReady) plog("question %d type %s layout %s choices %d time %d image %.80s", e->index, e->qtype, e->layout, e->numChoices, e->timeMs, e->image);
+}
+
+static void parseResult(KEvent *e, JNode *c) {
+	e->type = KE_RESULT;
+	e->hasAnswer = jbool(c, "hasAnswer", true);
+	e->correct = jbool(c, "isCorrect", false);
+	e->points = (int)jnum(c, "points", 0);
+	JNode *pd = jget(c, "pointsData");
+	if (pd) {
+		e->points = (int)jnum(pd, "totalPointsWithBonuses", e->points);
+		JNode *st = jget(pd, "answerStreakPoints");
+		if (st) e->streak = (int)jnum(st, "streakLevel", 0);
+	}
+	e->score = (int)jnum(c, "totalScore", 0);
+	e->rank = (int)jnum(c, "rank", 0);
+	snprintf(e->qtype, sizeof e->qtype, "%s", jstr(c, "type", ""));
+	JNode *nm = jget(c, "nemesis");
+	if (nm && nm->type == J_OBJ) { plain(e->nemesis, sizeof e->nemesis, jstr(nm, "name", "")); e->nemesisScore = (int)jnum(nm, "totalScore", 0); }
+	plain(e->answerText, sizeof e->answerText, jstr(c, "text", ""));
+}
+
+static void parseRanking(KEvent *e, JNode *c) {
+	e->type = KE_RANKING;
+	e->rank = (int)jnum(c, "rank", 0); e->score = (int)jnum(c, "totalScore", 0);
+	e->correctCount = (int)jnum(c, "correctCount", 0); e->incorrectCount = (int)jnum(c, "incorrectCount", 0);
+	snprintf(e->medal, sizeof e->medal, "%s", jstr(c, "podiumMedalType", ""));
+}
+
+// recovery data: what the game is doing right now (sent after joining or getting back in),
+// handled like kahoot.it's onReceiveRecoveryDataFromPlayer (a running question is shown and can be answered)
+static void onRecovery(Session *s, KEvent *e, JNode *c) {
+	if (jbool(c, "wasControllerKicked", false)) { pushSimple(s, KE_FAIL, KF_KICKED, "The host removed you from the game."); s->abort = true; return; }
+	int st = (int)jnum(c, "state", -1);
+	JNode *d = jget(c, "data");
+	plog("recovery state %d", st);
+	// avatars, as kahoot.it reads them here: on if the lobby lets players change them (data.canChangeAvatar)
+	// or if the player already has one saved; there's no separate "avatars on" message for a fresh join
+	JNode *av = jget(c, "avatar");
+	bool hasAv = av && av->type == J_OBJ && jhas(av, "type");
+	if (hasAv) { s->avType = (int)jnum(av, "type", 0); s->avItem = (int)jnum(av, "item", 0); }
+	bool canAv = st == 0 && d && d->type == J_OBJ && jbool(d, "canChangeAvatar", false);
+	if (canAv || hasAv) {
+		KEvent *a = calloc(1, sizeof *a);
+		a->type = KE_AVATAR; a->canChange = canAv; a->avatarType = s->avType; a->avatarItem = s->avItem;
+		JNode *ts = jget(c, "avatarTimestamp");
+		if (ts && ts->type == J_STR) snprintf(a->text, sizeof a->text, "%s", jstr(c, "avatarTimestamp", ""));
+		else if (ts) snprintf(a->text, sizeof a->text, "%.0f", jnum(c, "avatarTimestamp", 0));
+		plog("avatars on (can change %d, avatar %d/%d)", canAv, s->avType, s->avItem);
+		push(s, a); free(a);
+	}
+	switch (st) {
+	case 0: e->type = KE_LOBBY; push(s, e); break;                                         // before the quiz
+	case 1: e->type = KE_QUIZ_START; push(s, e); break;                                    // quiz started
+	case 2: if (d) { JNode *g = jget(d, "getReady"); parseQuestion(e, g ? g : d, true); push(s, e); } break;
+	case 3: if (d) { parseQuestion(e, d, false); push(s, e); } break;                      // a question is running: show it
+	case 4: case 5: {                                                                       // between questions
+		JNode *ra = d ? jget(d, "revealAnswer") : NULL;
+		if (ra && jbool(ra, "hasAnswer", false)) parseResult(e, ra); else e->type = KE_WAIT_NEXT;
+		push(s, e); break;
+	}
+	case 6: if (d) { parseRanking(e, d); push(s, e); } break;                              // game over
+	case 9: e->type = KE_TEAM_TALK; push(s, e); break;
+	case 11: e->type = KE_PAUSE; push(s, e); break;
+	default: if (st >= 12) { e->type = KE_MODE_UNSUPPORTED; e->code = 1000 + st; push(s, e); }
+	}
+}
+
 static void onPlayer(Session *s, int id, JNode *c) {
 	KEvent *e = calloc(1, sizeof *e);
 	switch (id) {
@@ -253,66 +382,32 @@ static void onPlayer(Session *s, int id, JNode *c) {
 		break;
 	}
 	case 9: e->type = KE_QUIZ_START; push(s, e); break;
-	case 1: case 2: {
-		e->type = id == 1 ? KE_GET_READY : KE_QUESTION;
-		e->index = (int)jnum(c, "gameBlockIndex", jnum(c, "questionIndex", 0));
-		e->total = (int)jnum(c, "totalGameBlockCount", 0);
-		snprintf(e->qtype, sizeof e->qtype, "%s", jstr(c, "type", jstr(c, "gameBlockType", "quiz")));
-		snprintf(e->layout, sizeof e->layout, "%s", jstr(c, "layout", ""));
-		if (id == 1) e->timeMs = jhas(c, "getReadyTimeAvailable") ? (int)jnum(c, "getReadyTimeAvailable", 5000)
-		                     : jhas(c, "timeLeft") ? (int)(jnum(c, "timeLeft", 5) * 1000) : 5000;
-		else e->timeMs = (int)jnum(c, "timeRemaining", jnum(c, "timeAvailable", 20000));     // ms left
-		plain(e->title, sizeof e->title, jstr(c, "title", ""));
-		JNode *ch = jget(c, "choices");
-		int nc = (int)jnum(c, "numberOfChoices", jlen(ch));
-		if (nc <= 0) nc = jlen(ch);
-		if (nc > K_MAXCHOICES) nc = K_MAXCHOICES;
-		e->numChoices = nc;
-		for (int i = 0; i < nc && ch; i++) {
-			JNode *o = jat(ch, i);
-			const char *a = o ? jstr(o, "answer", NULL) : NULL;
-			if (a && *a) { plain(e->choice[i], sizeof e->choice[i], a); e->hasChoiceText = true; }
-		}
-		e->allowed = (int)jnum(c, "numberOfAnswersAllowed", 1);
-		push(s, e);
-		break;
-	}
+	case 1: case 2: parseQuestion(e, c, id == 1); push(s, e); break;
 	case 7: e->type = KE_TIME_UP; push(s, e); break;
-	case 8: {
-		e->type = KE_RESULT;
-		e->hasAnswer = jbool(c, "hasAnswer", true);
-		e->correct = jbool(c, "isCorrect", false);
-		e->points = (int)jnum(c, "points", 0);
-		JNode *pd = jget(c, "pointsData");
-		if (pd) {
-			e->points = (int)jnum(pd, "totalPointsWithBonuses", e->points);
-			JNode *st = jget(pd, "answerStreakPoints");
-			if (st) e->streak = (int)jnum(st, "streakLevel", 0);
-		}
-		e->score = (int)jnum(c, "totalScore", 0);
-		e->rank = (int)jnum(c, "rank", 0);
-		snprintf(e->qtype, sizeof e->qtype, "%s", jstr(c, "type", ""));
-		JNode *nm = jget(c, "nemesis");
-		if (nm && nm->type == J_OBJ) { plain(e->nemesis, sizeof e->nemesis, jstr(nm, "name", "")); e->nemesisScore = (int)jnum(nm, "totalScore", 0); }
-		plain(e->answerText, sizeof e->answerText, jstr(c, "text", ""));
-		push(s, e);
-		break;
-	}
-	case 13: {
-		e->type = KE_RANKING;
-		e->rank = (int)jnum(c, "rank", 0); e->score = (int)jnum(c, "totalScore", 0);
-		e->correctCount = (int)jnum(c, "correctCount", 0); e->incorrectCount = (int)jnum(c, "incorrectCount", 0);
-		snprintf(e->medal, sizeof e->medal, "%s", jstr(c, "podiumMedalType", ""));
-		push(s, e);
-		break;
-	}
+	case 8: parseResult(e, c); push(s, e); break;
+	case 13: parseRanking(e, c); push(s, e); break;
 	case 12: e->type = KE_FEEDBACK; push(s, e); break;
-	case 5: e->type = KE_PLAY_AGAIN; push(s, e); break;
+	case 5:
+		e->type = KE_PLAY_AGAIN; push(s, e);
+		if (jbool(c, "canChangeAvatar", false)) {                          // the new lobby lets players change avatars
+			memset(e, 0, sizeof *e); e->type = KE_AVATAR; e->canChange = true; e->avatarType = s->avType; e->avatarItem = s->avItem; push(s, e);
+		}
+		break;
 	case 30: e->type = jbool(c, "isPaused", jbool(c, "paused", true)) ? KE_PAUSE : KE_RESUME; push(s, e); break;
 	case 20: e->type = KE_TEAM_TALK; e->timeMs = (int)jnum(c, "timeTalk", 5000); push(s, e); break;
 	case 51: e->type = KE_TWOSTEP_WRONG; push(s, e); break;
 	case 52: e->type = KE_TWOSTEP_OK; push(s, e); break;
 	case 53: e->type = KE_TWOSTEP; push(s, e); break;
+	case 79: {                                                             // avatars on: current one and whether players may change it
+		JNode *cf = jget(c, "configuration");
+		if (cf && cf->type == J_OBJ) { s->avType = (int)jnum(cf, "type", s->avType); s->avItem = (int)jnum(cf, "item", s->avItem); }
+		e->type = KE_AVATAR; e->canChange = jbool(c, "canChange", false);
+		e->avatarType = s->avType; e->avatarItem = s->avItem;
+		snprintf(e->text, sizeof e->text, "%s", jstr(c, "versionTimestamp", ""));
+		push(s, e);
+		break;
+	}
+	case 112: e->type = KE_AVATAR_OFF; push(s, e); break;
 	case 10: {
 		bool kicked = jhas(c, "kickCode");
 		free(e);
@@ -320,19 +415,7 @@ static void onPlayer(Session *s, int id, JNode *c) {
 		s->abort = true;
 		return;
 	}
-	case 17: {                                                           // recovery data after joining / reconnecting
-		int st = (int)jnum(c, "state", -1);
-		JNode *d = jget(c, "data");
-		plog("recovery state %d", st);
-		if (st == 1 || st == 0) { e->type = KE_LOBBY; push(s, e); }
-		else if (st == 3 && d) {
-			e->type = KE_RANKING;
-			e->rank = (int)jnum(d, "rank", 0); e->score = (int)jnum(d, "totalScore", 0);
-			e->correctCount = (int)jnum(d, "correctCount", 0); e->incorrectCount = (int)jnum(d, "incorrectCount", 0);
-			if (e->rank || e->score) push(s, e);
-		}
-		break;
-	}
+	case 17: onRecovery(s, e, c); break;
 	default:
 		if (modeUnsupported(id)) { e->type = KE_MODE_UNSUPPORTED; e->code = id; push(s, e); }
 	}

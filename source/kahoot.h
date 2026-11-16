@@ -20,13 +20,16 @@ typedef enum {
 	KE_TIME_UP,
 	KE_RESULT,          // right/wrong, points, score, rank
 	KE_RANKING,         // end of the game: final rank and score
-	KE_FEEDBACK,        // host asks for feedback (not offered here; just a waiting screen)
+	KE_FEEDBACK,        // host asks players to rate the kahoot (kahoot_sendFeedback)
 	KE_PLAY_AGAIN,      // back to the lobby for another round
 	KE_PAUSE, KE_RESUME,
 	KE_TEAM_TALK,
 	KE_RECONNECTING, KE_RECONNECTED,
 	KE_MODE_UNSUPPORTED,// the host started a special game mode PinPlay can't play
 	KE_LOBBY,           // after a reconnect: still waiting for the game to start
+	KE_WAIT_NEXT,       // joined between questions: waiting for the next one
+	KE_AVATAR,          // the host allows avatars: canChange, avatarType/avatarItem = current, text = publishedAt
+	KE_AVATAR_OFF,      // avatars turned off
 } KEvType;
 
 enum { KF_NONE, KF_NOPIN, KF_NET, KF_DUPNAME, KF_BADNAME, KF_LOCKED, KF_UNSUPPORTED, KF_KICKED, KF_ENDED, KF_CANCEL };
@@ -41,6 +44,13 @@ typedef struct {
 	char title[480];
 	char choice[K_MAXCHOICES][160];
 	bool hasChoiceText;
+	bool answered;      // (rejoining) this question was already answered
+	// slider: min..max in steps; scale/nps: start..end with end labels
+	double sMin, sMax, sStep; char unit[32];
+	int scStart, scEnd; char scLow[64], scHigh[64], scLabelType[16];
+	char image[512];    // picture URL (pin questions)
+	// avatar
+	bool canChange; int avatarType, avatarItem;
 	// result / ranking
 	bool hasAnswer, correct;
 	int points, score, rank, streak, correctCount, incorrectCount;
@@ -56,7 +66,11 @@ void kahoot_setName(const char *name);                        // answer to KE_NA
 void kahoot_answerChoice(int qIndex, const char *qtype, int choice);
 void kahoot_answerMulti(int qIndex, const char *qtype, const int *choices, int n);
 void kahoot_answerText(int qIndex, const char *qtype, const char *text);
+void kahoot_answerNumber(int qIndex, const char *qtype, double value, int decimals);   // slider, scale, nps
+void kahoot_answerPin(int qIndex, const char *qtype, double x, double y);              // drop_pin / pin_it, 0..100 % of the picture
 void kahoot_twoStep(const int seq[4]);
+void kahoot_setAvatar(int type, int item);
+void kahoot_sendFeedback(int fun, int learning, int recommend, int overall, int totalScore);   // stars 1-5, thumbs 0/1, face -1/0/1
 const char *kahoot_nickname(void);
 
 // pieces exposed for the self-test

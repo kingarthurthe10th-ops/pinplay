@@ -34,12 +34,16 @@ static char initErr[96];
 static mbedtls_ssl_session saved; static bool haveSaved; static char savedHost[64];
 static LightLock saveLock;
 
-struct Conn { int sock; mbedtls_ssl_context ssl; volatile bool *abort; bool sslInit; };
+struct Conn { int sock; mbedtls_ssl_context ssl; volatile bool *abort; bool sslInit; u32 readTimeout; };   // readTimeout: ms, per connection
+
+// two threads can make connections at once (the game and picture/avatar downloads), so the shared random generator is locked
+static LightLock rngLock;
+static int lockedRandom(void *p, unsigned char *out, size_t n) { LightLock_Lock(&rngLock); int r = mbedtls_ctr_drbg_random(p, out, n); LightLock_Unlock(&rngLock); return r; }
 
 const char *tls_initError(void) { return initErr; }
 
 bool tls_init(void) {
-	LightLock_Init(&saveLock);
+	LightLock_Init(&saveLock); LightLock_Init(&rngLock);
 	if (!socBuf) socBuf = memalign(0x1000, SOC_SIZE);
 	if (!socBuf) { snprintf(initErr, sizeof initErr, "out of memory"); return false; }
 	socOk = R_SUCCEEDED(socInit(socBuf, SOC_SIZE));
@@ -57,11 +61,11 @@ bool tls_init(void) {
 	mbedtls_ssl_config_defaults(&conf, MBEDTLS_SSL_IS_CLIENT, MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT);
 	mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_REQUIRED);
 	mbedtls_ssl_conf_ca_chain(&conf, &cas, NULL);
-	mbedtls_ssl_conf_rng(&conf, mbedtls_ctr_drbg_random, &drbg);
+	mbedtls_ssl_conf_rng(&conf, lockedRandom, &drbg);
 	mbedtls_ssl_conf_min_version(&conf, MBEDTLS_SSL_MAJOR_VERSION_3, MBEDTLS_SSL_MINOR_VERSION_3);   // TLS 1.2
 	static const mbedtls_ecp_group_id curves[] = { MBEDTLS_ECP_DP_CURVE25519, MBEDTLS_ECP_DP_SECP256R1, MBEDTLS_ECP_DP_SECP384R1, MBEDTLS_ECP_DP_NONE };
 	mbedtls_ssl_conf_curves(&conf, curves);      // fast curves first: the old 3DS's CPU is slow
-	mbedtls_ssl_conf_read_timeout(&conf, 15000);
+	mbedtls_ssl_conf_read_timeout(&conf, 15000);       // (non-zero so mbedTLS uses bioRecvTimeout; the real limit is Conn.readTimeout)
 	tlsOk = true;
 	return true;
 }
@@ -126,8 +130,8 @@ static int bioSend(void *ctx, const unsigned char *b, size_t n) {
 	}
 	return MBEDTLS_ERR_NET_SEND_FAILED;
 }
-static int bioRecvTimeout(void *ctx, unsigned char *b, size_t n, uint32_t ms) {
-	Conn *c = ctx;
+static int bioRecvTimeout(void *ctx, unsigned char *b, size_t n, uint32_t confMs) {
+	Conn *c = ctx; u32 ms = c->readTimeout; (void)confMs;
 	u64 t0 = osGetTime();
 	while (1) {
 		int r = recv(c->sock, b, n, 0);
@@ -147,7 +151,7 @@ Conn *conn_open(const char *host, int port, volatile bool *abort, char *err, int
 	int s = tcpConnect(host, port, abort, err, errLen);
 	if (s < 0) return NULL;
 	Conn *c = calloc(1, sizeof *c);
-	c->sock = s; c->abort = abort;
+	c->sock = s; c->abort = abort; c->readTimeout = 15000;
 	mbedtls_ssl_init(&c->ssl); c->sslInit = true;
 	int r = mbedtls_ssl_setup(&c->ssl, &conf);
 	if (!r) r = mbedtls_ssl_set_hostname(&c->ssl, host);
@@ -188,7 +192,7 @@ int conn_write(Conn *c, const void *buf, int len) {
 }
 
 int conn_read(Conn *c, void *buf, int len, int timeoutMs) {
-	mbedtls_ssl_conf_read_timeout(&conf, timeoutMs > 0 ? timeoutMs : 1);   // (shared config; only one thread reads at a time)
+	c->readTimeout = timeoutMs > 0 ? timeoutMs : 1;
 	while (1) {
 		int r = mbedtls_ssl_read(&c->ssl, buf, len);
 		if (r > 0) return r;

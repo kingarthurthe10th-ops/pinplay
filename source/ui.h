@@ -79,3 +79,10 @@ bool ui_thumbDraw(float x, float y, float w, float h);
 int ui_wrap(const char *s, float size, float maxW, char lines[][160], int maxLines);
 // draws s word-wrapped inside the box, shrinking from maxSize until it fits; vertically centred. Returns the size used.
 float ui_textBox(float x, float y, float w, float h, float maxSize, float minSize, u32 c, int align, const char *s);
+
+// a picture from the network (RGBA8 pixels as 0xRRGGBBAA, up to 512x512)
+bool ui_imageSet(const u32 *px, int w, int h);
+void ui_imageClear(void);
+bool ui_imageDraw(float x, float y, float w, float h);
+int ui_imageW(void);
+int ui_imageH(void);

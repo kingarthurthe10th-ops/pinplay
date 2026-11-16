@@ -3,7 +3,8 @@
 import certifi, re, sys
 WANT = ["Amazon Root CA 1", "Amazon Root CA 2", "Amazon Root CA 3", "Amazon Root CA 4",
         "Starfield Services Root Certificate Authority - G2", "ISRG Root X1", "ISRG Root X2",
-        "DigiCert Global Root G2", "GTS Root R1", "GTS Root R4"]
+        "DigiCert Global Root G2", "GTS Root R1", "GTS Root R4",
+        "GlobalSign Root CA - R3", "GlobalSign Root R46", "GlobalSign Root E46"]  # (Unsplash pictures)
 text = open(certifi.where(), encoding="utf-8").read()
 out, found = [], set()
 for label, pem in re.findall(r"# Label: \"([^\"]+)\".*?(-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----)", text, re.S):

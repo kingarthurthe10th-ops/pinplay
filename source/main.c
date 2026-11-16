@@ -10,8 +10,10 @@
 #include "tls.h"
 #include "kahoot.h"
 #include "log.h"
+#include "fetch.h"
+#include "json.h"
 
-#define VERSION "1.0.0"
+#define VERSION "1.1.0"
 
 // test builds: PP_SHOTS draws every screen from made-up events and saves screenshots (no network);
 // PP_AUTOJOIN joins the game in sdmc:/pinplay_test.txt (PIN, nickname) and answers by itself, with screenshots.
@@ -20,7 +22,7 @@
 #endif
 
 typedef enum { SC_HOME, SC_CONNECT, SC_NAMERATOR, SC_LOBBY, SC_TWOSTEP, SC_QUIZSTART, SC_GETREADY, SC_QUESTION, SC_SENT,
-	SC_TIMEUP, SC_RESULT, SC_RANKING, SC_FEEDBACK, SC_NOTYPE, SC_MODE, SC_FAIL } Screen;
+	SC_TIMEUP, SC_RESULT, SC_RANKING, SC_FEEDBACK, SC_NOTYPE, SC_MODE, SC_FAIL, SC_AVATAR, SC_RATE, SC_WAITNEXT } Screen;
 
 static Screen sc = SC_HOME;
 static char pin[16], nick[32];
@@ -36,6 +38,19 @@ static char genName[40]; static int spinsLeft;
 static bool confirmLeave, quit;
 static int questionsSeen;
 static bool padUsed;                     // the D-pad highlight shows only once the D-pad has been used
+// slider / scale / pin answers
+static int sliderK, sliderN, scaleSel = -1; static float pinX = -1, pinY = -1;
+static char sentText[96];                // what was sent, for answers that aren't tiles
+static int textsSent;                    // word cloud / brainstorm can take several answers
+static Fetch *imgFetch; static int imgState;   // the pin question's picture: 0 none, 1 loading, 2 shown, 3 failed
+// avatars
+#define MAXAV 96
+static bool avatarOn, avatarCan; static int avType, avItem;
+static Fetch *avFetch; static int avStage; static char avStamp[32];   // stage 0 idle, 1 collections, 2 avatars, 3 ready, 4 failed
+static int avIds[MAXAV], itemIds[MAXAV]; static char avNames[MAXAV][32], itemNames[MAXAV][32]; static int avCount, itemCount;
+static int pickType, pickItem, pickTab; static float pickScroll; static float dragY0, scroll0; static bool dragging, dragMoved;
+// end-of-game rating
+static int rateFun, rateLearn = -1, rateRec = -1, rateFace = -2; static bool rateSent;
 
 // ---- colours and shapes of the answer tiles (the same colour/shape scheme players match on the host's screen)
 #define CRGB(r, g, b) (0xFF000000u | ((u32)(b) << 16) | ((u32)(g) << 8) | (u32)(r))   // (a constant version of UI_RGB)
@@ -80,12 +95,21 @@ static const char *typeName(const char *t, const char *layout) {
 	if (!strcmp(t, "feedback")) return "Feedback";
 	return t;
 }
-static bool isText(const char *t) { return !strcmp(t, "open_ended") || !strcmp(t, "word_cloud"); }
+static bool isText(const char *t) { return !strcmp(t, "open_ended") || !strcmp(t, "word_cloud") || !strcmp(t, "brainstorming") || !strcmp(t, "feedback"); }
+static bool isSlider(const char *t) { return !strcmp(t, "slider"); }
+static bool isScale(const char *t) { return !strcmp(t, "scale") || !strcmp(t, "nps"); }
+static bool isPin(const char *t) { return !strcmp(t, "drop_pin") || !strcmp(t, "pin_it"); }
+static int textMax(const char *t) { return !strcmp(t, "feedback") ? 250 : !strcmp(t, "brainstorming") ? 100 : 20; }
 static bool isMulti(const char *t) { return !strncmp(t, "multiple_select", 15); }
 static bool isJumble(const char *t) { return !strcmp(t, "jumble"); }
 static bool isChoice(const char *t) { return !strcmp(t, "quiz") || !strcmp(t, "survey"); }
-static bool playable(const char *t) { return isChoice(t) || isText(t) || isMulti(t) || isJumble(t); }
-static bool isPoll(const char *t) { return !strcmp(t, "survey") || !strcmp(t, "multiple_select_poll") || !strcmp(t, "word_cloud"); }
+static bool playable(const char *t) { return isChoice(t) || isText(t) || isMulti(t) || isJumble(t) || isSlider(t) || isScale(t) || isPin(t); }
+static bool isPoll(const char *t) {
+	return !strcmp(t, "survey") || !strcmp(t, "multiple_select_poll") || !strcmp(t, "word_cloud") || !strcmp(t, "brainstorming")
+		|| !strcmp(t, "feedback") || isScale(t) || !strcmp(t, "drop_pin");
+}
+static int stepDecimals(double step) { int d = 0; while (d < 4 && fabs(step * pow(10, d) - round(step * pow(10, d))) > 1e-6) d++; return d; }
+static double sliderValue(void) { double v = q.sMin + sliderK * q.sStep; return v > q.sMax ? q.sMax : v; }
 
 static const char *ordinal(int n, char *b) {
 	const char *suf = "th";
@@ -137,9 +161,80 @@ static void makeName(void) {
 }
 
 // ---- events from the game
+static Screen afterRating(void);
 static void go(Screen s) { sc = s; screenStart = osGetTime(); sel = 0; confirmLeave = false; padUsed = false; }
+static Screen afterRating(void) { return rk.type == KE_RANKING ? SC_RANKING : SC_FEEDBACK; }   // final place already shown? back to it
 
-static void resetAnswer(void) { memset(picked, 0, sizeof picked); orderN = 0; chosen = -1; typed[0] = 0; }
+static void resetAnswer(void) {
+	memset(picked, 0, sizeof picked); orderN = 0; chosen = -1; typed[0] = 0; sentText[0] = 0; textsSent = 0;
+	scaleSel = -1; pinX = pinY = -1;
+	sliderN = (int)round((q.sMax - q.sMin) / q.sStep); if (sliderN < 1) sliderN = 1; if (sliderN > 10000) sliderN = 10000;
+	sliderK = sliderN / 2;
+}
+
+// the pin question's picture, resized by Kahoot's image server to fit the touch screen and sent as PNG
+static void startPicture(const char *url) {
+	if (imgFetch) { fetch_free(imgFetch); imgFetch = NULL; }
+	ui_imageClear(); imgState = 0;
+	if (!url[0]) { imgState = 3; return; }
+	char u[700]; const char *sep = strchr(url, '?') ? "&" : "?";
+	const char *media = "https://media.kahoot.it/";              // originals can be full size: get them resized instead
+	if (!strncmp(url, media, strlen(media)) && !strchr(url, '?'))
+		snprintf(u, sizeof u, "https://images-cdn.kahoot.it/%s?width=320&height=196&fit=bounds&format=png", url + strlen(media));
+	else if (strstr(url, "images-cdn.kahoot")) snprintf(u, sizeof u, "%s%swidth=320&height=196&fit=bounds&format=png", url, sep);
+	else if (strstr(url, "images.unsplash.com")) snprintf(u, sizeof u, "%s%sw=320&h=196&fit=max&fm=png", url, sep);
+	else snprintf(u, sizeof u, "%s", url);
+	imgFetch = fetch_start(u, true);
+	imgState = imgFetch ? 1 : 3;
+}
+static void pollPicture(void) {
+	if (imgState != 1 || !imgFetch) return;
+	int st = fetch_state(imgFetch);
+	if (st == FETCH_RUNNING) return;
+	int w = 0, h = 0; const u32 *px = st == FETCH_DONE ? fetch_pixels(imgFetch, &w, &h) : NULL;
+	imgState = px && ui_imageSet(px, w, h) ? 2 : 3;
+	fetch_free(imgFetch); imgFetch = NULL;
+}
+
+// the avatar list (Kahoot's free avatars and accessories), fetched once the host turns avatars on
+static void startAvatarList(void) {
+	if (avStage == 1 || avStage == 2 || avStage == 3) return;
+	char u[256]; snprintf(u, sizeof u, "https://apis.kahoot.it/game-reward-service/api/v1/config/avatar/collections%s%s", avStamp[0] ? "?publishedAt=" : "", avStamp);
+	avFetch = fetch_start(u, false); avStage = avFetch ? 1 : 4;
+}
+static const char *avName(int id) { for (int i = 0; i < avCount; i++) if (avIds[i] == id) return avNames[i]; return id ? "Avatar" : "None"; }
+static const char *itemName(int id) { if (!id) return "No accessory"; for (int i = 0; i < itemCount; i++) if (itemIds[i] == id) return itemNames[i]; return "Accessory"; }
+static void pollAvatarList(void) {
+	if ((avStage != 1 && avStage != 2) || !avFetch) return;
+	int st = fetch_state(avFetch);
+	if (st == FETCH_RUNNING) return;
+	JNode *j = st == FETCH_DONE ? json_parse(fetch_body(avFetch, NULL)) : NULL;
+	fetch_free(avFetch); avFetch = NULL;
+	if (!j) { avStage = 4; return; }
+	if (avStage == 1) {                                  // collections: use the default (free) one
+		char ids[256] = ""; int n = 0;
+		for (int pass = 0; pass < 2 && !n; pass++)
+			for (JNode *c = j->child; c; c = c->next)
+				if ((pass == 0 && jbool(c, "defaultCollection", false)) || (pass == 1 && !jbool(c, "partnerCollection", false))) {
+					int l = strlen(ids); snprintf(ids + l, sizeof ids - l, "%scollectionId=%s", n++ ? "&" : "", jstr(c, "id", "0"));
+					if (pass == 1 && n >= 3) break;
+				}
+		json_free(j);
+		if (!n) { avStage = 4; return; }
+		char u[512]; snprintf(u, sizeof u, "https://apis.kahoot.it/game-reward-service/api/v1/config/avatar?%s%s%s&showPartnerCollections=true", ids, avStamp[0] ? "&publishedAt=" : "", avStamp);
+		avFetch = fetch_start(u, false); avStage = avFetch ? 2 : 4;
+		return;
+	}
+	avCount = itemCount = 0;
+	for (JNode *a = jget(j, "avatars") ? jget(j, "avatars")->child : NULL; a && avCount < MAXAV; a = a->next)
+		if (jbool(a, "enabled", false) && jbool(a, "free", false)) { avIds[avCount] = (int)jnum(a, "id", 0); snprintf(avNames[avCount++], 32, "%s", jstr(a, "name", "?")); }
+	itemIds[itemCount] = 0; snprintf(itemNames[itemCount++], 32, "None");
+	for (JNode *a = jget(j, "items") ? jget(j, "items")->child : NULL; a && itemCount < MAXAV; a = a->next)
+		if (jbool(a, "enabled", false) && jbool(a, "free", false)) { itemIds[itemCount] = (int)jnum(a, "id", 0); snprintf(itemNames[itemCount++], 32, "%s", jstr(a, "name", "?")); }
+	json_free(j);
+	plog("avatars: %d characters, %d accessories", avCount, itemCount - 1);
+	avStage = avCount ? 3 : 4;
+}
 
 static void startJoin(void);
 
@@ -154,9 +249,14 @@ static void handle(const KEvent *e) {
 	case KE_TWOSTEP_WRONG: twoN = 0; twoSent = false; twoWrong = true; go(SC_TWOSTEP); break;
 	case KE_TWOSTEP_OK: twoWrong = false; go(SC_LOBBY); break;
 	case KE_QUIZ_START: score = 0; rank = 0; haveResult = false; questionsSeen = 0; go(SC_QUIZSTART); break;
-	case KE_GET_READY: q = *e; q.title[0] = 0; qStart = osGetTime(); go(SC_GETREADY); break;
+	case KE_GET_READY:
+		q = *e; qStart = osGetTime();
+		if (!strcmp(q.qtype, "content")) { ui_imageClear(); imgState = 0; go(SC_NOTYPE); break; }   // slides only get this message: show the slide's title
+		q.title[0] = 0; go(SC_GETREADY); break;
 	case KE_QUESTION:
 		q = *e; qStart = osGetTime(); resetAnswer(); questionsSeen++;
+		if (isPin(q.qtype)) startPicture(q.image); else { ui_imageClear(); imgState = 0; }
+		if (q.answered) { snprintf(sentText, sizeof sentText, "You already answered this one."); go(SC_SENT); break; }
 		go(!strcmp(q.qtype, "content") ? SC_NOTYPE : playable(q.qtype) ? SC_QUESTION : SC_NOTYPE);
 		break;
 	case KE_TIME_UP: if (sc == SC_QUESTION || sc == SC_GETREADY) go(SC_TIMEUP); break;
@@ -166,8 +266,15 @@ static void handle(const KEvent *e) {
 		go(SC_RESULT);
 		break;
 	case KE_RANKING: rk = *e; score = e->score; rank = e->rank; go(SC_RANKING); break;
-	case KE_FEEDBACK: if (sc != SC_RANKING) go(SC_FEEDBACK); break;
-	case KE_PLAY_AGAIN: score = 0; rank = 0; haveResult = false; go(SC_LOBBY); break;
+	case KE_FEEDBACK: if (!rateSent) { rateFun = 0; rateLearn = rateRec = -1; rateFace = -2; go(SC_RATE); } else if (sc != SC_RANKING) go(SC_FEEDBACK); break;
+	case KE_PLAY_AGAIN: score = 0; rank = 0; haveResult = false; rateSent = false; rk.type = KE_STATUS; go(SC_LOBBY); break;
+	case KE_WAIT_NEXT: go(SC_WAITNEXT); break;
+	case KE_AVATAR:
+		avatarOn = true; avatarCan = e->canChange; avType = e->avatarType; avItem = e->avatarItem;
+		snprintf(avStamp, sizeof avStamp, "%s", e->text);
+		if (avatarCan) startAvatarList();
+		break;
+	case KE_AVATAR_OFF: avatarOn = avatarCan = false; if (sc == SC_AVATAR) go(SC_LOBBY); break;
 	case KE_PAUSE: paused = true; break;
 	case KE_RESUME: paused = false; break;
 	case KE_TEAM_TALK: snprintf(statusText, sizeof statusText, "Team talk! Discuss the answer with your team."); break;
@@ -180,7 +287,7 @@ static void handle(const KEvent *e) {
 static void leaveGame(void) { kahoot_stop(); reconnecting = paused = false; go(SC_HOME); }
 
 static void startJoin(void) {
-	statusText[0] = 0; reconnecting = paused = false; twoWrong = false;
+	statusText[0] = 0; reconnecting = paused = false; twoWrong = false; rateSent = false; avatarOn = avatarCan = false; rk.type = KE_STATUS;
 	score = rank = 0; haveResult = false;
 	kahoot_start(pin, nick);
 	go(SC_CONNECT);
@@ -305,6 +412,26 @@ static void frame(void) {
 		ui_text(200, 50, 0.6f, C_MUTED, AL_CENTER, "See your nickname on the host's screen?");
 		ui_textBox(20, 80, 360, 60, 1.1f, 0.6f, C_TEXT, AL_CENTER, nick);
 		ui_text(200, 160, 0.55f, C_MUTED, AL_CENTER, "Waiting for the host to start the game...");
+		if (avatarOn && avStage == 3) { snprintf(b, sizeof b, "Avatar: %s%s%s", avName(avType), avItem ? " with " : "", avItem ? itemName(avItem) : ""); ui_textFit(200, 186, 0.5f, C_ACCENT2, AL_CENTER, 360, b); }
+		footer();
+		break;
+	case SC_AVATAR:
+		header("Choose your avatar", pin);
+		ui_circle(200, 88, 40, C_ACCENT);
+		{ char ini[8] = ""; const char *n = avName(pickType); int l = n[0] ? (((u8)n[0] < 0x80) ? 1 : ((u8)n[0] < 0xE0) ? 2 : 3) : 0; memcpy(ini, n, l); ini[l] = 0;
+		  ui_text(200, 66, 1.3f, C_WHITE, AL_CENTER, ini); }
+		ui_textFit(200, 138, 0.85f, C_TEXT, AL_CENTER, 380, avName(pickType));
+		ui_textFit(200, 170, 0.6f, C_MUTED, AL_CENTER, 380, pickItem ? itemName(pickItem) : "No accessory");
+		ui_text(200, 196, 0.45f, C_MUTED, AL_CENTER, "Your avatar shows next to your name on the host's screen.");
+		break;
+	case SC_RATE:
+		header("Rate this kahoot", NULL);
+		bigMessage("How was it?", "The host asked players for feedback. Pick an answer in each row, then Send. You can also skip it.", C_TEXT);
+		footer();
+		break;
+	case SC_WAITNEXT:
+		header("You're in!", pin);
+		bigMessage("Wait for the next question", "You joined between questions. The next one will show up here.", C_TEXT);
 		footer();
 		break;
 	case SC_TWOSTEP:
@@ -331,21 +458,23 @@ static void frame(void) {
 		  snprintf(b, sizeof b, "%d", (left + 999) / 1000); ui_circle(200, 150, 28, C_ACCENT); ui_text(200, 133, 1.0f, C_WHITE, AL_CENTER, b); }
 		footer();
 		break;
-	case SC_QUESTION: case SC_SENT: case SC_TIMEUP: case SC_NOTYPE:
-		snprintf(b, sizeof b, q.total ? "Question %d of %d" : "Question %d", q.index + 1, q.total);
+	case SC_QUESTION: case SC_SENT: case SC_TIMEUP: case SC_NOTYPE: {
+		const char *what = !strcmp(q.qtype, "content") ? "Slide" : "Question";
+		if (q.total) snprintf(b, sizeof b, "%s %d of %d", what, q.index + 1, q.total); else snprintf(b, sizeof b, "%s %d", what, q.index + 1);
 		header(b, typeName(q.qtype, q.layout));
 		if (q.title[0]) ui_textBox(16, 32, 368, 140, 0.8f, 0.42f, C_TEXT, AL_CENTER, q.title);
 		else ui_textBox(16, 32, 368, 140, 0.65f, 0.45f, C_MUTED, AL_CENTER, "Look at the host's screen for the question.");
-		if (sc == SC_SENT) ui_text(200, 178, 0.6f, C_ACCENT2, AL_CENTER, isPoll(q.qtype) ? "Vote sent! Waiting for the others..." : "Answer sent! Waiting for the result...");
+		if (sc == SC_SENT) ui_text(200, 178, 0.6f, C_ACCENT2, AL_CENTER, isPoll(q.qtype) ? "Sent! Waiting for the others..." : "Answer sent! Waiting for the result...");
 		else if (sc == SC_TIMEUP) ui_text(200, 178, 0.6f, C_BAD, AL_CENTER, "Time's up!");
 		else if (sc == SC_QUESTION) timerBar(186);
 		footer();
 		break;
+	}
 	case SC_RESULT: {
 		bool poll = isPoll(res.qtype) || isPoll(q.qtype);
 		u32 bg = !res.hasAnswer ? C_CARD2 : poll ? C_ACCENT : res.correct ? C_OK : C_BAD;
 		ui_rect(0, 0, 400, 216, bg);
-		const char *t = !res.hasAnswer ? "Time's up" : poll ? "Thanks for voting!" : res.correct ? "Correct!" : "Incorrect";
+		const char *t = !res.hasAnswer ? "Time's up" : poll ? (isText(q.qtype) || isPin(q.qtype) ? "Thanks for answering!" : "Thanks for voting!") : res.correct ? "Correct!" : "Incorrect";
 		ui_text(200, 30, 1.2f, C_WHITE, AL_CENTER, t);
 		if (res.hasAnswer && res.correct) {
 			snprintf(b, sizeof b, "+ %d", res.points); ui_round(130, 78, 140, 40, 10, UI_RGB(48, 150, 92));
@@ -373,7 +502,7 @@ static void frame(void) {
 	}
 	case SC_FEEDBACK:
 		header("Game over", NULL);
-		bigMessage("Thanks for playing!", "The host is collecting feedback. Your final place will show up here.", C_TEXT);
+		bigMessage("Thanks for playing!", rateSent ? "Thanks for the feedback! Your final place will show up here." : "Your final place will show up here.", C_TEXT);
 		footer();
 		break;
 	case SC_MODE:
@@ -446,10 +575,94 @@ static void frame(void) {
 	}
 	case SC_QUESTION: {
 		if (isText(q.qtype)) {
-			ui_textBox(10, 10, 300, 60, 0.55f, 0.45f, C_MUTED, AL_CENTER, q.qtype[0] == 'w' ? "Type a word or short phrase for the word cloud." : "Type your answer. Spelling counts!");
-			if (ui_button(10, 80, 300, 70, NULL, "Type answer", true, IC_NONE) || (k & KEY_A)) {
-				if (askText(typed, sizeof typed, "Your answer", false, 20)) { kahoot_answerText(q.index, q.qtype, typed); go(SC_SENT); }
+			const char *hint = !strcmp(q.qtype, "word_cloud") ? "Type a word or short phrase for the word cloud." : !strcmp(q.qtype, "brainstorming") ? "Type an idea. The host's screen collects everyone's ideas."
+				: !strcmp(q.qtype, "feedback") ? "Write your feedback for the host." : "Type your answer. Spelling counts!";
+			bool many = (!strcmp(q.qtype, "word_cloud") || !strcmp(q.qtype, "brainstorming")) && q.allowed > 1;
+			ui_textBox(10, 10, 300, 60, 0.55f, 0.45f, C_MUTED, AL_CENTER, hint);
+			if (textsSent) { snprintf(b, sizeof b, "Sent %d of %d: %s", textsSent, q.allowed, typed); ui_textFit(160, 160, 0.5f, C_ACCENT2, AL_CENTER, 300, b); }
+			if (ui_button(10, 80, 300, 70, NULL, textsSent ? "Send another" : !strcmp(q.qtype, "brainstorming") ? "Type idea" : "Type answer", true, IC_NONE) || (k & KEY_A)) {
+				typed[0] = 0;
+				if (askText(typed, sizeof typed, "Your answer", false, textMax(q.qtype))) {
+					kahoot_answerText(q.index, q.qtype, typed); textsSent++;
+					if (!many || textsSent >= q.allowed) go(SC_SENT);
+				}
 			}
+			if (many && textsSent && (ui_button(70, 186, 180, 44, NULL, "Done", false, IC_NONE) || (k & KEY_B))) go(SC_SENT);
+		} else if (isSlider(q.qtype)) {
+			int dec = stepDecimals(q.sStep);
+			snprintf(b, sizeof b, "%.*f%s%s", dec, sliderValue(), q.unit[0] ? " " : "", q.unit);
+			ui_textFit(160, 18, 1.0f, C_TEXT, AL_CENTER, 300, b);
+			const float tx = 24, tw = 272, ty = 92;
+			ui_round(tx, ty - 4, tw, 8, 4, C_CARD2);
+			float kx = tx + tw * sliderK / sliderN;
+			ui_round(tx, ty - 4, kx - tx, 8, 4, C_ACCENT);
+			if (ui_touchDown() && ui_touchIn(0, ty - 30, 320, 60)) { float x, y; ui_touchPos(&x, &y); float f = (x - tx) / tw; if (f < 0) f = 0; if (f > 1) f = 1; sliderK = (int)round(f * sliderN); }
+			ui_circle(kx, ty, 14, C_WHITE); ui_circle(kx, ty, 10, C_ACCENT);
+			snprintf(b, sizeof b, "%.*f", dec, q.sMin); ui_text(tx, ty + 18, 0.45f, C_MUTED, AL_LEFT, b);
+			snprintf(b, sizeof b, "%.*f", dec, q.sMax); ui_text(tx + tw, ty + 18, 0.45f, C_MUTED, AL_RIGHT, b);
+			if ((ui_button(24, 136, 80, 44, NULL, "-", false, IC_NONE) || (hidKeysDown() & KEY_LEFT)) && sliderK > 0) sliderK--;
+			if ((ui_button(216, 136, 80, 44, NULL, "+", false, IC_NONE) || (hidKeysDown() & KEY_RIGHT)) && sliderK < sliderN) sliderK++;
+			if (hidKeysHeld() & KEY_L) sliderK = sliderK > 0 ? sliderK - 1 : 0;
+			if (hidKeysHeld() & KEY_R) sliderK = sliderK < sliderN ? sliderK + 1 : sliderN;
+			if (ui_button(60, 192, 200, 42, NULL, "Submit", true, IC_NONE) || (k & KEY_A)) {
+				kahoot_answerNumber(q.index, q.qtype, sliderValue(), dec);
+				snprintf(sentText, sizeof sentText, "%.*f%s%s", dec, sliderValue(), q.unit[0] ? " " : "", q.unit); go(SC_SENT);
+			}
+		} else if (isScale(q.qtype)) {
+			int n = q.scEnd - q.scStart + 1, rows = n > 6 ? 2 : 1, per = (n + rows - 1) / rows;
+			float bw = (300 - (per - 1) * 6) / (float)per, bh = rows == 2 ? 46 : 60;
+			if ((hidKeysDown() & KEY_RIGHT) && scaleSel < n - 1) scaleSel++;
+			if ((hidKeysDown() & KEY_LEFT) && scaleSel > 0) scaleSel--;
+			for (int i = 0; i < n; i++) {
+				float x = 10 + (i % per) * (bw + 6), y = 20 + (i / per) * (bh + 8);
+				snprintf(b, sizeof b, "%d", q.scStart + i);
+				bool on = scaleSel == i, held = ui_touchIn(x, y, bw, bh);
+				ui_round(x, y, bw, bh, 10, on ? C_ACCENT : held ? C_LINE : C_CARD2);
+				ui_text(x + bw / 2, y + bh / 2 - 12, 0.8f, C_TEXT, AL_CENTER, b);
+				if (ui_tapped(x, y, bw, bh)) scaleSel = i;
+			}
+			const char *lo = q.scLow, *hi = q.scHigh, *lt = q.scLabelType;
+			if (!lo[0]) lo = !strcmp(lt, "satisfaction") ? "Very unsatisfied" : !strcmp(lt, "probability") ? "Not likely" : !strcmp(lt, "difficulty") ? "Very easy" : !strcmp(lt, "none") ? "" : "Strongly disagree";
+			if (!hi[0]) hi = !strcmp(lt, "satisfaction") ? "Very satisfied" : !strcmp(lt, "probability") ? "Very likely" : !strcmp(lt, "difficulty") ? "Very hard" : !strcmp(lt, "none") ? "" : "Strongly agree";
+			float ly = 20 + rows * (bh + 8) + 4;
+			ui_textFit(12, ly, 0.45f, C_MUTED, AL_LEFT, 145, lo); ui_textFit(308, ly, 0.45f, C_MUTED, AL_RIGHT, 145, hi);
+			if (scaleSel >= 0) {
+				if (ui_button(60, 192, 200, 42, NULL, "Submit", true, IC_NONE) || (k & KEY_A)) {
+					kahoot_answerNumber(q.index, q.qtype, q.scStart + scaleSel, 0);
+					snprintf(sentText, sizeof sentText, "You picked %d", q.scStart + scaleSel); go(SC_SENT);
+				}
+			} else ui_buttonOff(60, 192, 200, 42, "Pick a number", IC_NONE);
+		} else if (isPin(q.qtype)) {
+			pollPicture();
+			// the picture fitted into the area above the button
+			float ax = 0, ay = 0, aw = 320, ah = 196, iw = aw, ih = ah;
+			ui_rect(ax, ay, aw, ah, C_CARD);
+			if (imgState == 1) { ui_spinner(160, 86, 14, C_ACCENT2); ui_text(160, 112, 0.5f, C_MUTED, AL_CENTER, "Loading the picture..."); }
+			else if (imgState == 3) ui_textBox(20, 60, 280, 70, 0.5f, 0.4f, C_MUTED, AL_CENTER, "Couldn't load the picture. Look at the host's screen and tap the same spot here.");
+			float px0 = ax, py0 = ay;
+			if (imgState == 2) {
+				// ui_imageDraw scales to the given box; keep the picture's shape
+				float w = ui_imageW(), h = ui_imageH(), sc2 = fminf(aw / w, ah / h);
+				iw = w * sc2; ih = h * sc2; px0 = ax + (aw - iw) / 2; py0 = ay + (ah - ih) / 2;
+				ui_imageDraw(px0, py0, iw, ih);
+			}
+			if (ui_touchDown() && ui_touchIn(px0, py0, iw, ih)) { float x, y; ui_touchPos(&x, &y); pinX = (x - px0) / iw * 100; pinY = (y - py0) / ih * 100; }
+			u32 kh = hidKeysHeld();
+			if (kh & (KEY_UP | KEY_DOWN | KEY_LEFT | KEY_RIGHT)) {
+				if (pinX < 0) { pinX = 50; pinY = 50; }
+				if (kh & KEY_LEFT) pinX -= 0.6f; if (kh & KEY_RIGHT) pinX += 0.6f; if (kh & KEY_UP) pinY -= 0.6f; if (kh & KEY_DOWN) pinY += 0.6f;
+				pinX = fmaxf(0, fminf(100, pinX)); pinY = fmaxf(0, fminf(100, pinY));
+			}
+			if (pinX >= 0) {
+				float mx = px0 + pinX / 100 * iw, my = py0 + pinY / 100 * ih;
+				ui_tri(mx - 7, my - 14, mx + 7, my - 14, mx, my, C_BAD); ui_circle(mx, my - 18, 9, C_BAD); ui_circle(mx, my - 18, 4, C_WHITE);
+			}
+			if (pinX >= 0) {
+				if (ui_button(60, 200, 200, 36, NULL, "Submit", true, IC_NONE) || (k & KEY_A)) {
+					kahoot_answerPin(q.index, q.qtype, pinX, pinY);
+					snprintf(sentText, sizeof sentText, "Pin placed"); go(SC_SENT);
+				}
+			} else ui_buttonOff(60, 200, 200, 36, "Tap to place your pin", IC_NONE);
 		} else if (isMulti(q.qtype)) {
 			int hit = tiles(&q, 0, 192, picked, NULL, NULL);
 			if (hit >= 0) picked[hit] = !picked[hit];
@@ -476,9 +689,9 @@ static void frame(void) {
 			ui_round(60, 40, 200, 130, 14, TILE[st]);
 			if (q.hasChoiceText) { shape(st, 82, 62, 12, C_WHITE); ui_textBox(72, 84, 176, 80, 0.6f, 0.4f, C_WHITE, AL_CENTER, q.choice[chosen]); }
 			else shape(st, 160, 105, 36, C_WHITE);
-		} else if (typed[0] && sc == SC_SENT) {
+		} else if ((typed[0] || sentText[0]) && sc == SC_SENT) {
 			ui_round(20, 60, 280, 80, 14, C_CARD2);
-			ui_textBox(30, 66, 260, 68, 0.75f, 0.45f, C_TEXT, AL_CENTER, typed);
+			ui_textBox(30, 66, 260, 68, 0.75f, 0.45f, C_TEXT, AL_CENTER, sentText[0] ? sentText : typed);
 		} else ui_textBox(20, 60, 280, 80, 0.6f, 0.45f, C_MUTED, AL_CENTER, sc == SC_SENT ? "Answer sent." : "No answer this time.");
 		break;
 	}
@@ -498,6 +711,59 @@ static void frame(void) {
 			|| (!again && (k & KEY_A))) leaveGame();
 		break;
 	}
+	case SC_AVATAR: {
+		// two lists (characters, accessories) of name buttons; drag or D-pad to scroll
+		if (ui_button(8, 4, 148, 32, NULL, "Character", pickTab == 0, IC_NONE)) { pickTab = 0; pickScroll = 0; }
+		if (ui_button(164, 4, 148, 32, NULL, "Accessory", pickTab == 1, IC_NONE)) { pickTab = 1; pickScroll = 0; }
+		if (k & KEY_L) { pickTab = 0; pickScroll = 0; } if (k & KEY_R) { pickTab = 1; pickScroll = 0; }
+		int n = pickTab ? itemCount : avCount; const float top = 42, bot = 194, rowH = 36;
+		float maxScroll = fmaxf(0, ((n + 1) / 2) * rowH - (bot - top));
+		float tx, ty; ui_touchPos(&tx, &ty);
+		if (ui_touchDown() && ty >= top && ty < bot) {
+			if (!dragging) { dragging = true; dragMoved = false; dragY0 = ty; scroll0 = pickScroll; }
+			if (fabsf(ty - dragY0) > 8) dragMoved = true;
+			if (dragMoved) pickScroll = scroll0 - (ty - dragY0);
+		} else if (!ui_touchDown()) dragging = false;
+		if (hidKeysHeld() & KEY_DOWN) pickScroll += 4; if (hidKeysHeld() & KEY_UP) pickScroll -= 4;
+		pickScroll = fmaxf(0, fminf(maxScroll, pickScroll));
+		C2D_Flush(); C3D_SetScissor(GPU_SCISSOR_NORMAL, (u32)(240 - bot), 0, (u32)(240 - top), 320);
+		for (int i = 0; i < n; i++) {
+			float x = 8 + (i % 2) * 156, y = top + (i / 2) * rowH - pickScroll;
+			if (y + rowH < top || y > bot) continue;
+			int id = pickTab ? itemIds[i] : avIds[i];
+			bool on = pickTab ? pickItem == id : pickType == id;
+			ui_round(x, y + 2, 148, rowH - 4, 8, on ? C_ACCENT : C_CARD2);
+			ui_textFit(x + 74, y + 10, 0.5f, C_TEXT, AL_CENTER, 136, pickTab ? itemNames[i] : avNames[i]);
+			if (!dragMoved && ui_tapped(x, y + 2, 148, rowH - 4) && ty >= top && ty < bot) { if (pickTab) pickItem = id; else pickType = id; }
+		}
+		C2D_Flush(); C3D_SetScissor(GPU_SCISSOR_DISABLE, 0, 0, 0, 0);
+		if (ui_button(8, 200, 148, 36, NULL, "Cancel", false, IC_NONE) || (k & KEY_B)) go(SC_LOBBY);
+		else if (ui_button(164, 200, 148, 36, NULL, "Done", true, IC_NONE) || (k & KEY_A)) {
+			avType = pickType; avItem = pickItem; kahoot_setAvatar(avType, avItem); go(SC_LOBBY);
+		}
+		break;
+	}
+	case SC_RATE: {
+		static const char *rowName[] = { "Fun", "Did you learn something?", "Would you recommend it?", "How do you feel?" };
+		for (int r = 0; r < 4; r++) {
+			float y = 4 + r * 46;
+			ui_text(10, y, 0.45f, C_MUTED, AL_LEFT, rowName[r]);
+			int opts = r == 0 ? 5 : r == 3 ? 3 : 2;
+			for (int i = 0; i < opts; i++) {
+				float bw = r == 0 ? 56 : r == 3 ? 96 : 146, x = 8 + i * (bw + (r == 0 ? 4 : r == 3 ? 6 : 12)), by = y + 16;
+				bool on = r == 0 ? rateFun >= i + 1 : r == 1 ? rateLearn == 1 - i : r == 2 ? rateRec == 1 - i : rateFace == i - 1;
+				ui_round(x, by, bw, 26, 8, on ? (r == 0 ? UI_RGB(216, 158, 0) : C_ACCENT) : C_CARD2);
+				if (r == 0) shape(5, x + bw / 2, by + 13, 9, on ? C_WHITE : C_MUTED);
+				else ui_text(x + bw / 2, by + 5, 0.5f, C_TEXT, AL_CENTER, r == 3 ? (i == 0 ? "Sad" : i == 1 ? "Okay" : "Happy") : (i == 0 ? "Yes" : "No"));
+				if (ui_tapped(x, by, bw, 26)) { if (r == 0) rateFun = i + 1; else if (r == 1) rateLearn = 1 - i; else if (r == 2) rateRec = 1 - i; else rateFace = i - 1; }
+			}
+		}
+		bool ready = rateFun && rateLearn >= 0 && rateRec >= 0 && rateFace >= -1;
+		if (ui_button(8, 198, 120, 38, NULL, "Skip", false, IC_NONE) || (k & KEY_B)) go(afterRating());
+		else if (ready) { if (ui_button(136, 198, 176, 38, NULL, "Send", true, IC_NONE) || (k & KEY_A)) { kahoot_sendFeedback(rateFun, rateLearn, rateRec, rateFace, score); rateSent = true; go(afterRating()); } }
+		else ui_buttonOff(136, 198, 176, 38, "Send", IC_NONE);
+		break;
+	}
 	default: {   // lobby, get ready, results, ranking: a summary card and a Leave button
 		ui_round(10, 10, 300, 110, 12, C_CARD);
 		ui_textFit(160, 20, 0.7f, C_TEXT, AL_CENTER, 280, nick);
@@ -510,6 +776,10 @@ static void frame(void) {
 			else if (ui_button(165, 160, 145, 48, NULL, "Leave", true, IC_NONE) || (k & KEY_A)) leaveGame();
 		} else if (sc == SC_RANKING) {
 			if (ui_button(10, 160, 300, 50, NULL, "Back to start", true, IC_NONE) || (k & KEY_A)) leaveGame();
+		} else if (sc == SC_LOBBY && avatarOn && avatarCan) {
+			if (avStage == 3) { if (ui_button(10, 128, 300, 40, NULL, "Change avatar", true, IC_NONE) || (k & KEY_Y)) { pickType = avType; pickItem = avItem; pickTab = 0; pickScroll = 0; go(SC_AVATAR); } }
+			else ui_buttonOff(10, 128, 300, 40, avStage == 4 ? "Avatars unavailable" : "Loading avatars...", IC_NONE);
+			if (ui_button(70, 180, 180, 40, NULL, "Leave game", false, IC_NONE) || (k & KEY_B)) confirmLeave = true;
 		} else if (ui_button(70, 170, 180, 44, NULL, "Leave game", false, IC_NONE) || (k & KEY_B)) confirmLeave = true;
 		break;
 	}
@@ -523,7 +793,8 @@ static void frame(void) {
 static int fakeStep = -1; static u64 fakeAt;
 static void fakeEvents(void) {           // walks through every screen with made-up game data, one screenshot each
 	static const char *names[] = { "home", "connect", "lobby", "namerator", "twostep", "getready", "quiz_text", "quiz_shapes", "truefalse", "sent", "result_right",
-		"result_wrong", "multi", "jumble", "typeanswer", "poll_result", "notype", "timeup", "ranking", "fail_pin", "fail_dup", "reconnect" };
+		"result_wrong", "multi", "jumble", "typeanswer", "poll_result", "notype", "timeup", "ranking", "fail_pin", "fail_dup", "reconnect",
+		"slider", "scale", "nps", "pin", "brainstorm", "lobby_avatar", "avatar_pick", "avatar_items", "rate", "waitnext", "rejoin_answered" };
 	if (osGetTime() < fakeAt) return;
 	if (fakeStep >= 0) shotNow(names[fakeStep]);
 	fakeStep++; fakeAt = osGetTime() + 700;
@@ -560,6 +831,34 @@ static void fakeEvents(void) {           // walks through every screen with made
 	case 19: e.type = KE_FAIL; e.code = KF_NOPIN; snprintf(e.text, sizeof e.text, "There's no game with that PIN. Check it and try again."); handle(&e); break;
 	case 20: e.type = KE_FAIL; e.code = KF_DUPNAME; snprintf(e.text, sizeof e.text, "Someone in this game already has that nickname."); handle(&e); break;
 	case 21: go(SC_LOBBY); reconnecting = true; break;
+	case 22: e.type = KE_QUESTION; e.index = 1; e.total = 12; snprintf(e.qtype, 32, "slider"); e.timeMs = 30000; e.sMin = 1900; e.sMax = 2020; e.sStep = 1;
+		snprintf(e.unit, 32, "AD"); snprintf(e.title, sizeof e.title, "In which year did the first person walk on the Moon?"); handle(&e); sliderK = 69; break;
+	case 23: e.type = KE_QUESTION; e.index = 2; e.total = 12; snprintf(e.qtype, 32, "scale"); e.scStart = 1; e.scEnd = 5; snprintf(e.scLabelType, 16, "agreement");
+		snprintf(e.title, sizeof e.title, "Homework helps me learn."); handle(&e); scaleSel = 3; break;
+	case 24: e.type = KE_QUESTION; e.index = 3; e.total = 12; snprintf(e.qtype, 32, "nps"); e.scStart = 0; e.scEnd = 10; snprintf(e.scLabelType, 16, "probability");
+		snprintf(e.title, sizeof e.title, "How likely are you to recommend this class to a friend?"); handle(&e); break;
+	case 25: {
+		e.type = KE_QUESTION; e.index = 4; e.total = 12; snprintf(e.qtype, 32, "pin_it"); e.timeMs = 30000;
+		snprintf(e.title, sizeof e.title, "Tap on the sun"); handle(&e);
+		static u32 px[300 * 180];                   // a made-up picture: sky, ground and a sun
+		for (int y = 0; y < 180; y++) for (int x = 0; x < 300; x++) {
+			u32 c = y > 130 ? 0x3C8C3CFF : 0x6EB4F0FF; int dx = x - 220, dy = y - 50; if (dx * dx + dy * dy < 400) c = 0xF8D040FF;
+			px[y * 300 + x] = c; }
+		ui_imageSet(px, 300, 180); imgState = 2; pinX = 73; pinY = 28; break;
+	}
+	case 26: e.type = KE_QUESTION; e.index = 5; e.total = 12; snprintf(e.qtype, 32, "brainstorming"); e.allowed = 3; e.timeMs = 60000;
+		snprintf(e.title, sizeof e.title, "Ideas for the class trip?"); handle(&e); textsSent = 1; snprintf(typed, sizeof typed, "Science museum"); break;
+	case 27: avatarOn = avatarCan = true; avStage = 3; avCount = 0;
+		{ static const char *nm[] = { "Sun", "Snowman", "Woodchuck", "Moose", "Dog", "Cat", "Mouse", "Rabbit", "Fox", "Wolf", "Raccoon", "Panda", "Snake", "Frog" };
+		  for (int i = 0; i < 14; i++) { avIds[i] = 1000 + i; snprintf(avNames[i], 32, "%s", nm[i]); } avCount = 14;
+		  static const char *it[] = { "None", "Crown", "Top hat", "Sunglasses", "Viking helmet", "Scarf" };
+		  for (int i = 0; i < 6; i++) { itemIds[i] = i ? 2000 + i : 0; snprintf(itemNames[i], 32, "%s", it[i]); } itemCount = 6; }
+		avType = 1008; avItem = 2001; score = 0; rank = 0; go(SC_LOBBY); break;
+	case 28: pickType = 1008; pickItem = 2001; pickTab = 0; pickScroll = 0; go(SC_AVATAR); break;
+	case 29: pickTab = 1; pickScroll = 0; pickItem = 2002; break;
+	case 30: e.type = KE_FEEDBACK; rateSent = false; handle(&e); rateFun = 4; rateLearn = 1; break;
+	case 31: e.type = KE_WAIT_NEXT; handle(&e); break;
+	case 32: e.type = KE_QUESTION; e.index = 6; e.total = 12; snprintf(e.qtype, 32, "quiz"); e.numChoices = 4; e.answered = true; handle(&e); break;
 	}
 }
 #endif
@@ -567,8 +866,8 @@ static void fakeEvents(void) {           // walks through every screen with made
 #ifdef PP_AUTOJOIN
 static Screen lastShot = (Screen)-1; static u64 shotAt, answerAt; static int answered = -1; static u64 endAt;
 static const char *scName(Screen s) {
-	static const char *n[] = { "home", "connect", "namerator", "lobby", "twostep", "quizstart", "getready", "question", "sent", "timeup", "result", "ranking", "feedback", "notype", "mode", "fail" };
-	return n[s];
+	static const char *n[] = { "home", "connect", "namerator", "lobby", "twostep", "quizstart", "getready", "question", "sent", "timeup", "result", "ranking", "feedback", "notype", "mode", "fail", "avatar", "rate", "waitnext" };
+	return (unsigned)s < sizeof n / sizeof *n ? n[s] : "other";
 }
 static void autoDrive(void) {
 	if (sc != lastShot) { lastShot = sc; shotAt = osGetTime() + 400; }
@@ -583,10 +882,23 @@ static void autoDrive(void) {
 			if (isText(q.qtype)) { snprintf(typed, sizeof typed, "test"); kahoot_answerText(q.index, q.qtype, typed); go(SC_SENT); }
 			else if (isMulti(q.qtype)) { kahoot_answerMulti(q.index, q.qtype, &c, 1); go(SC_SENT); }
 			else if (isJumble(q.qtype)) { int o4[4] = { 0, 1, 2, 3 }; kahoot_answerMulti(q.index, q.qtype, o4, n < 4 ? n : 4); go(SC_SENT); }
+			else if (isSlider(q.qtype)) { kahoot_answerNumber(q.index, q.qtype, sliderValue(), stepDecimals(q.sStep)); go(SC_SENT); }
+			else if (isScale(q.qtype)) { kahoot_answerNumber(q.index, q.qtype, q.scStart, 0); go(SC_SENT); }
+			else if (isPin(q.qtype)) { if (imgState == 1) { answered = -1; answerAt = osGetTime() + 500; return; } kahoot_answerPin(q.index, q.qtype, 50, 50); go(SC_SENT); }
 			else sendChoice(c);
 		}
 	}
-	if ((sc == SC_RANKING || sc == SC_FAIL) && !endAt) endAt = osGetTime() + 8000;
+	static bool avDone;                                       // change avatar once in the lobby (same call as the picker's Done)
+	if (sc == SC_LOBBY && avatarCan && avStage == 3 && avCount > 3 && !avDone && osGetTime() - screenStart > 2000) {
+		avDone = true; avType = avIds[3]; avItem = itemCount > 2 ? itemIds[2] : 0;
+		plog("auto avatar -> %s (%d) with %s (%d)", avNames[3], avType, itemCount > 2 ? itemNames[2] : "none", avItem);
+		kahoot_setAvatar(avType, avItem);
+	}
+	if (sc == SC_RATE && !rateSent && osGetTime() - screenStart > 1500) {   // fill in the end-of-game rating
+		plog("auto rating");
+		kahoot_sendFeedback(4, 1, 1, 1, score); rateSent = true; go(afterRating());
+	}
+	if ((sc == SC_RANKING || sc == SC_FAIL) && !endAt) endAt = osGetTime() + 20000;
 	if (endAt && osGetTime() > endAt) quit = true;
 }
 #endif
@@ -613,6 +925,15 @@ int main(void) {
 		}
 		if (f) fclose(f);
 		plog("solvetest %d/%d passed", pass, n);
+		// background downloads: the real avatar list and a real picture through our TLS + PNG code
+		startAvatarList();
+		startPicture("https://media.kahoot.it/1fb7468d-cd1e-4e24-8836-f5b785dea965");   // a real pin question picture (JPEG)
+		u64 t0 = osGetTime();
+		while (osGetTime() - t0 < 30000 && (avStage == 1 || avStage == 2 || imgState == 1)) {
+			pollAvatarList(); pollPicture(); svcSleepThread(50000000);
+		}
+		plog("fetchtest: avatar stage %d (%d characters, %d accessories, first %s / %s), picture state %d (%dx%d)",
+			avStage, avCount, itemCount, avCount ? avNames[0] : "-", itemCount > 1 ? itemNames[1] : "-", imgState, ui_imageW(), ui_imageH());
 		quit = true;
 	}
 #endif
@@ -629,6 +950,8 @@ int main(void) {
 		ui_input();
 		KEvent e;
 		while (kahoot_poll(&e)) handle(&e);
+		pollAvatarList();
+		if (sc != SC_QUESTION) pollPicture();
 #ifdef PP_SHOTS
 		fakeEvents();
 #endif
